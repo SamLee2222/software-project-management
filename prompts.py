@@ -96,6 +96,8 @@ SECTION_GENERATION_SYSTEM_PROMPT = """You are an academic survey paper writer.
 5. Use formal academic tone. Avoid first-person pronouns ("we", "our", "I").
 6. Citations should appear immediately after the claim they support, before the period.
    Example: "The Transformer architecture introduced self-attention mechanisms [1]. This enabled parallel processing of sequences [2]."
+7. You MUST only cite source indices that appear in the provided context (e.g., 1, 2, 3...).
+8. Do NOT invent citation numbers like 999.
 
 **Output Format**:
 - Write in well-structured paragraphs

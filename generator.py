@@ -1,17 +1,15 @@
 import os
 import re
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Set
 from pathlib import Path
-
-# 尝试导入 LangChain 相关模块（完整版使用）
-try:
-    from langchain_openai import ChatOpenAI
-    from langchain_core.prompts import ChatPromptTemplate
-    from langchain_core.output_parsers import StrOutputParser
-    LANGCHAIN_AVAILABLE = True
-except ImportError:
-    LANGCHAIN_AVAILABLE = False
-    print("Warning: LangChain not installed. Install with: pip install langchain langchain-openai")
+from langchain_ollama import ChatOllama
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from tenacity import retry, stop_after_attempt, wait_exponential
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from collections import OrderedDict
+LANGCHAIN_AVAILABLE = True
 
 from prompts import (
     SECTION_GENERATION_SYSTEM_PROMPT,
@@ -22,7 +20,7 @@ from prompts import (
 
 def mock_generate_section(section_title: str, context_chunks: List[Dict]) -> str:
     """
-    Mock 版本的章节生成函数，用于 Sprint 1 流程测试
+    Mock 版本的章节生成函数，用于 Sprint 2 流程测试
     
     Args:
         section_title: 章节标题
@@ -54,66 +52,35 @@ The content generation module has been successfully integrated into the workflow
 """
 
 class SectionGenerator:
-    def __init__(self, model_name: str = "gpt-4o-mini", 
-                 temperature: float = 0.1,
-                 api_key: Optional[str] = None,
-                 base_url: Optional[str] = None
-                ):
-        """
-        初始化章节生成器
-        Args:
-            model_name: LLM 模型名称（OpenAI 兼容接口）
-            temperature: 温度参数，低温度减少幻觉
-            api_key: API 密钥（若不提供则从环境变量读取）
-            base_url: API 基础 URL（用于代理或本地模型
-        """
-        if not LANGCHAIN_AVAILABLE:
-            raise ImportError("LangChain is required for SectionGenerator. Install with: pip install langchain langchain-openai")
+    def __init__(self, model_name: str = "deepseek-r1:1.5b", temperature: float = 0.1):
+        # 1. 初始化 Ollama（无 API Key）
+        self.llm = ChatOllama(model=model_name, 
+                              temperature=temperature, 
+                              num_predict=4096)
         
-        # 配置 OpenAI 客户端
-        kwargs = {
-            "model": model_name,
-            "temperature": temperature,
-            "max_tokens": 4096
-        }
-        if api_key:
-            kwargs["api_key"] = api_key
-        if base_url:
-            kwargs["base_url"] = base_url
+        # 2. 包装重试
+        self._llm_with_retry = retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=2, max=10)
+        )(self.llm.invoke)
         
-        self.llm = ChatOpenAI(**kwargs)
+        # 3. 构建链（与 Sprint 1 完全相同）
         self.chain = self._build_chain()
     
     def _build_chain(self):
-        """构建生成链：SystemPrompt + UserPrompt + LLM + OutputParser"""
         prompt = ChatPromptTemplate.from_messages([
             ("system", SECTION_GENERATION_SYSTEM_PROMPT),
             ("human", SECTION_GENERATION_USER_TEMPLATE)
         ])
-        # 推荐使用 prompt | llm | parser 模式[reference:4]
-        return prompt | self.llm | StrOutputParser()
+        # 使用带重试的 invoke
+        return prompt | self._llm_with_retry | StrOutputParser()
     
-    def generate_section(
-        self, 
-        section_title: str, 
-        context_chunks: List[Dict],  # 来自成员B的retrieve()返回结果
-        subsections: Optional[List[str]] = None,
-        guidelines: Optional[str] = None
-    ) -> str:
-        """
-        生成单个章节的内容
-        
-        Args:
-            section_title: 章节标题
-            context_chunks: 检索到的相关文本块，每个块包含content和metadata
-            subsections: 该章节需要覆盖的子节列表
-            guidelines: 章节写作指导
-        
-        Returns:
-            生成的章节文本（Markdown格式）
-        """
+    def generate_section(self, section_title, context_chunks: List[Dict], 
+                         subsections: Optional[List[str]] = None, 
+                         guidelines: Optional[str] = None) -> str:
+        """生成单个章节"""
         # 格式化上下文，为每个chunk添加索引
-        formatted_chunks = self._format_context_chunks(context_chunks)
+        formatted_chunks = format_context_chunks(context_chunks)
         
         # 确定子节列表
         if not subsections:
@@ -127,15 +94,16 @@ class SectionGenerator:
             section_key = section_title.lower().split()[0]
             guidelines = SECTION_GUIDELINES.get(section_key, "Write a comprehensive academic section based on the provided context.")
         
-        # 调用链
+        # 调用生成链
         response = self.chain.invoke({
             "section_title": section_title,
-            "subsections": ", ".join(subsections),
+            "subsections": subsections_str,
             "context_chunks": formatted_chunks,
             "section_guidelines": guidelines
         })
         
         return response.strip()
+
     
     def generate_outline(
         self,
@@ -173,6 +141,140 @@ class SectionGenerator:
         response = self.llm.invoke(user_message)
         return response.content
     
+    def generate_full_survey(
+        self,
+        title: str,
+        outline: Dict,  # 大纲，包含 sections 列表
+        context_chunks_by_section: Dict[str, List[Dict]],  # 每个章节对应的检索结果
+        metadata_store: Dict[int, Dict],
+        output_path: Optional[str] = None
+    ) -> str:
+        """
+        生成完整的综述论文
+
+        Args:
+            title: 论文标题
+            outline: 大纲字典，如 {"sections": [{"title": "Intro", ...}]}
+            context_chunks_by_section: 每个章节的检索上下文
+            metadata_store: 论文元数据
+            output_path: 如果提供，保存到文件
+
+        Returns:
+            完整的 Markdown 字符串
+        """
+        chapters = {}
+        for section_info in outline.get("sections", []):
+            section_title = section_info["title"]
+            context = context_chunks_by_section.get(section_title, [])
+            # 调用已有的章节生成方法
+            content = self.generate_section(section_title, context)
+            chapters[section_title] = content
+
+        # 整合
+        final_md = finalize_survey(title, chapters, metadata_store, include_toc=True)
+
+        if output_path:
+            save_survey_to_file(output_path, final_md)
+
+        return final_md
+    
+def extract_all_citations_from_chapters(chapters: Dict[str, str]) -> List[int]:
+    """
+    从所有章节内容中提取所有引用索引，并按首次出现顺序返回
+    """
+    citation_order = []
+    seen = set()
+    # 正则匹配 [数字] 或 [数字,数字] 等，这里简单提取所有数字
+    pattern = r'\[(\d+)\]'
+    for content in chapters.values():
+        for match in re.finditer(pattern, content):
+            idx = int(match.group(1))
+            if idx not in seen:
+                seen.add(idx)
+                citation_order.append(idx)
+    return citation_order
+
+def generate_table_of_contents(chapters: Dict[str, str]) -> str:
+    """
+    根据章节内容生成 Markdown 目录
+    提取每个章节内容中的一级标题（以 # 开头，但不是 ## 开头）
+    """
+    toc_lines = ["## Table of Contents\n"]
+    for title, content in chapters.items():
+        # 从内容中提取第一个一级标题（如果存在），否则使用传入的章节标题
+        match = re.search(r'^# (.+)$', content, re.MULTILINE)
+        if match:
+            heading = match.group(1)
+        else:
+            heading = title
+        # 生成锚点（小写，空格转连字符）
+        anchor = heading.lower().replace(' ', '-').replace('?', '').replace(':', '')
+        toc_lines.append(f"- [{heading}](#{anchor})")
+    return "\n".join(toc_lines)
+
+def generate_references(citation_indices: List[int], metadata_store: Dict[int, Dict]) -> str:
+    """
+    根据引用索引列表和元数据存储生成参考文献列表
+    metadata_store 格式: {1: {"title": "...", "authors": "...", "year": ..., "url": ...}}
+    """
+    ref_lines = ["## References\n"]
+    for idx in citation_indices:
+        meta = metadata_store.get(idx, {})
+        title = meta.get("title", "Unknown Title")
+        authors = meta.get("authors", "Unknown Author")
+        year = meta.get("year", "n.d.")
+        url = meta.get("url", "")
+        # 根据常见格式生成
+        ref_lines.append(f"[{idx}] {authors}. {title}. {year}. {url}".strip())
+    return "\n".join(ref_lines)
+
+def finalize_survey(
+    title: str,
+    chapters: Dict[str, str],
+    metadata_store: Dict[int, Dict],
+    include_toc: bool = True
+) -> str:
+    """
+    整合完整的综述论文
+
+    Args:
+        title: 论文标题
+        chapters: 章节字典，键为章节名，值为章节内容（Markdown格式）
+        metadata_store: 论文元数据，索引 -> 元数据
+        include_toc: 是否生成目录
+
+    Returns:
+        完整的 Markdown 格式论文
+    """
+    document_parts = []
+
+    # 1. 标题
+    document_parts.append(f"# {title}\n")
+
+    # 2. 目录（可选）
+    if include_toc:
+        toc = generate_table_of_contents(chapters)
+        document_parts.append(toc + "\n")
+
+    # 3. 正文（按顺序拼接）
+    for chapter_title, content in chapters.items():
+        # 确保内容不以一级标题开头（因为可能已经包含），但保留原样
+        document_parts.append(content)
+        document_parts.append("\n")  # 章节间空行
+
+    # 4. 提取所有引用索引并生成参考文献
+    citation_indices = extract_all_citations_from_chapters(chapters)
+    if citation_indices:
+        references = generate_references(citation_indices, metadata_store)
+        document_parts.append(references)
+
+    return "\n".join(document_parts)
+
+def save_survey_to_file(output_path: str, final_markdown: str) -> None:
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(final_markdown)
+    print(f"Survey saved to {output_path}")
+    
 def create_generator(
     model_name: str = "gpt-4o-mini",
     temperature: float = 0.1,
@@ -195,34 +297,13 @@ def create_generator(
         return SectionGenerator(model_name=model_name, temperature=temperature)
     
 if __name__ == "__main__":
-    # 测试 Mock 版本
-    print("=== Testing Mock Generator ===")
-    mock_result = mock_generate_section(
-        "Introduction",
-        [{"content": "test", "metadata": {}}]
-    )
-    print(mock_result)
-    
-    # 测试完整版（需要设置 OPENAI_API_KEY 环境变量）
-    if LANGCHAIN_AVAILABLE and os.getenv("OPENAI_API_KEY"):
-        print("\n=== Testing Real Generator ===")
-        try:
-            generator = SectionGenerator()
-            # 模拟检索结果
-            mock_chunks = [
-                {
-                    "content": "Transformers have revolutionized NLP. They use self-attention.",
-                    "metadata": {"paper_title": "Attention Is All You Need", "authors": ["Vaswani"]}
-                }
-            ]
-            result = generator.generate_section(
-                "Introduction",
-                mock_chunks,
-                subsections=["Background", "Contributions"],
-                guidelines="Introduce the field and state the paper's contributions."
-            )
-            print(result)
-        except Exception as e:
-            print(f"Real generator test failed: {e}")
-    else:
-        print("\nSkipping real generator test: LangChain not available or OPENAI_API_KEY not set.")
+    chapters = {
+        "Introduction": "# Introduction\nThis is a test [1].",
+        "Methods": "# Methods\nWe used [2] and [1]."
+    }
+    metadata_store = {
+        1: {"title": "Paper A", "authors": "Author A", "year": 2020, "url": "http://a.com"},
+        2: {"title": "Paper B", "authors": "Author B", "year": 2021, "url": "http://b.com"}
+    }
+    final = finalize_survey("Test Survey", chapters, metadata_store, include_toc=True)
+    print(final)
